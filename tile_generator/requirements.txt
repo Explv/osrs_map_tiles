@@ -1,0 +1,8 @@
+scikit-image==0.17.2
+imutils==0.5.3
+opencv-python==4.3.0.36
+pixelmatch==0.2.1
+numpy==1.19.0
+pyvips==2.1.12
+requests==2.27.1
+beautifulsoup4==4.11.1
