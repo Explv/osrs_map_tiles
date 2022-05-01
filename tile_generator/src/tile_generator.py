@@ -10,13 +10,14 @@ from skimage.measure import compare_ssim
 import logging
 import numpy as np
 import pyvips
+import glob
 import json
 import subprocess
 from datetime import datetime
 import re
 import zipfile
 
-CACHES_URL = "https://archive.openrs2.org/caches"
+CACHES_BASE_URL = "https://archive.openrs2.org"
 
 LOG = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ OUTPUT_DIR = os.path.join(REPO_DIR, 'output/')
 CACHE_DIR = os.path.join(OUTPUT_DIR, 'cache/')
 DIFF_DIR = os.path.join(OUTPUT_DIR, 'diff/')
 XTEA_FILE = os.path.join(CACHE_DIR, "xteas.json")
+GENERATED_FULL_IMAGES = os.path.join(OUTPUT_DIR, 'generated_images/')
 TILE_DIR = REPO_DIR
 
 image_prefix = "full_image_"
@@ -47,8 +49,64 @@ logging.basicConfig(
 )
 
 
+class Side(Enum):
+    TOP_LEFT = 1
+    TOP_RIGHT = 2
+    BOTTOM_LEFT = 3
+    BOTTOM_RIGHT = 4
+
+
+def main():
+    os.makedirs(DIFF_DIR, exist_ok=True)
+
+    LOG.info("Downloading cache & XTEAs")
+    download_cache()
+
+    LOG.info("Building map base images")
+    build_full_map_images()
+
+    for plane in range(MAX_Z + 1):
+        LOG.info(f"Generating plane {plane}")
+        LOG.info("Loading images into memory")
+    
+        old_image_location = os.path.join(REPO_DIR, f"full_image_{plane}.png")
+        new_image_location = os.path.join(GENERATED_FULL_IMAGES, f"img-{plane}.png")
+
+        old_image = pyvips.Image.new_from_file(old_image_location)
+    
+        new_image = pyvips.Image.new_from_file(new_image_location)
+    
+        image_width = new_image.width
+        image_width_tiles = int(image_width / TILE_SIZE_PX)
+    
+        starting_zoom = int(math.sqrt(math.pow(2, math.ceil(math.log(image_width_tiles) / math.log(2)))))
+    
+        LOG.info("Calculating changed tiles")
+        changed_tiles = get_changed_tiles(old_image, new_image, starting_zoom)
+    
+        LOG.info("Storing diff image")
+        output_tile_diff_image(changed_tiles, new_image_location,  str(Path(DIFF_DIR, f"diff_{plane}.png")))
+    
+        LOG.info(f"Found {len(changed_tiles)} changed tiles at zoom level {starting_zoom}")
+    
+        LOG.info(f"Saving changed tiles at zoom level {starting_zoom}")
+        for tile in changed_tiles:
+            save_tile(tile["image"], plane, starting_zoom, tile["x"], tile["y"])
+    
+        next_changed_tiles = changed_tiles
+        for zoom in range(starting_zoom + 1, MAX_ZOOM + 1):
+            LOG.info(f"Splitting changed tiles from zoom level {zoom-1} to zoom level {zoom}")
+            next_changed_tiles = split_tiles_to_new_zoom(next_changed_tiles, plane, zoom)
+            LOG.info("Done")
+    
+        for zoom in reversed(range(MIN_ZOOM + 1, starting_zoom + 1)):
+            LOG.info(f"Joining changed tiles from zoom level {zoom} to zoom level {zoom - 1}")
+            changed_tiles = join_tiles_to_new_zoom(changed_tiles, plane, zoom, zoom - 1)
+            LOG.info("Done")
+
+
 def download_cache():
-    caches = requests.get(CACHES_URL, allow_redirects=True)
+    caches = requests.get(CACHES_BASE_URL + "/caches", allow_redirects=True)
     soup = BeautifulSoup(caches.content)
     cache_table = soup.find('table')
     table_body = cache_table.find('tbody')
@@ -85,7 +143,7 @@ def download_cache():
 
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    xtea_file_json = requests.get("https://archive.openrs2.org" + xtea_link, allow_redirects=True).json()
+    xtea_file_json = requests.get(CACHES_BASE_URL + xtea_link, allow_redirects=True).json()
 
     output = []
 
@@ -99,7 +157,7 @@ def download_cache():
         json.dump(output, f,  indent=4)
 
     cache_zip = os.path.join(CACHE_DIR, "cache.zip")
-    cache_content = requests.get("https://archive.openrs2.org" + cache_link, allow_redirects=True).content
+    cache_content = requests.get(CACHES_BASE_URL + cache_link, allow_redirects=True).content
 
     with open(cache_zip, 'wb') as f:
         f.write(cache_content)
@@ -113,70 +171,25 @@ def download_cache():
 def build_full_map_images():
     os.chdir('/runelite/cache')
 
-    subprocess.run(['git', 'pull'])
-    subprocess.run(['mvn', '-Dmaven.test.skip', '-DskipTests', 'package'])
+    subprocess.run(['git', 'pull'], check=True)
+
+    subprocess.run(['mvn', '-Dmaven.test.skip', '-DskipTests', 'package'], check=True)
+
+    jar_file = glob.glob("target/*jar-with-dependencies.jar")[0]
+
     subprocess.run(
         [
             'java', 
             '-Xmx8g', 
             '-cp', 
-            'target/cache-1.8.19-SNAPSHOT-jar-with-dependencies.jar',
+            jar_file,
             'net.runelite.cache.MapImageDumper', 
-            '/repo/output/cache/', 
-            '/repo/output/cache/xteas.json', 
-            '/repo/output/generated_images/'
+            CACHE_DIR, 
+            XTEA_FILE, 
+            GENERATED_FULL_IMAGES
         ], 
         check=True
     )
-
-
-def main():
-    os.makedirs(DIFF_DIR, exist_ok=True)
-
-    print("Downloading cache & XTEAs")
-    download_cache()
-
-    print("Building map base images")
-    build_full_map_images()
-
-    for plane in range(MAX_Z + 1):
-        LOG.info(f"Generating plane {plane}")
-        LOG.info("Loading images into memory")
-    
-        old_image_location = os.path.join(REPO_DIR, f"full_image_{plane}.png")
-        new_image_location = os.path.join(REPO_DIR, "output/generated_images", f"img-{plane}.png")
-
-        old_image = pyvips.Image.new_from_file(old_image_location)
-    
-        new_image = pyvips.Image.new_from_file(new_image_location)
-    
-        image_width = new_image.width
-        image_width_tiles = int(image_width / TILE_SIZE_PX)
-    
-        starting_zoom = int(math.sqrt(math.pow(2, math.ceil(math.log(image_width_tiles) / math.log(2)))))
-    
-        LOG.info("Calculating changed tiles")
-        changed_tiles = get_changed_tiles(old_image, new_image, starting_zoom)
-    
-        LOG.info("Storing diff image")
-        output_tile_diff_image(changed_tiles, new_image_location,  str(Path(DIFF_DIR, f"diff_{plane}.png")))
-    
-        LOG.info(f"Found {len(changed_tiles)} changed tiles at zoom level {starting_zoom}")
-    
-        LOG.info(f"Saving changed tiles at zoom level {starting_zoom}")
-        for tile in changed_tiles:
-            save_tile(tile["image"], plane, starting_zoom, tile["x"], tile["y"])
-    
-        next_changed_tiles = changed_tiles
-        for zoom in range(starting_zoom + 1, MAX_ZOOM + 1):
-            LOG.info(f"Splitting changed tiles from zoom level {zoom-1} to zoom level {zoom}")
-            next_changed_tiles = split_tiles_to_new_zoom(next_changed_tiles, plane, zoom)
-            LOG.info("Done")
-    
-        for zoom in reversed(range(MIN_ZOOM + 1, starting_zoom + 1)):
-            LOG.info(f"Joining changed tiles from zoom level {zoom} to zoom level {zoom - 1}")
-            changed_tiles = join_tiles_to_new_zoom(changed_tiles, plane, zoom, zoom - 1)
-            LOG.info("Done")
 
 
 def get_changed_tiles(old_image, new_image, zoom):
@@ -270,13 +283,6 @@ def split_tiles_to_new_zoom(changed_tiles, plane, new_zoom):
         save_tile(tile_image_3, plane, new_zoom, new_x + 1, new_y + 1)
 
     return new_changed_tiles
-
-
-class Side(Enum):
-    TOP_LEFT = 1
-    TOP_RIGHT = 2
-    BOTTOM_LEFT = 3
-    BOTTOM_RIGHT = 4
 
 
 def join_tiles_to_new_zoom(changed_tiles, plane, current_zoom, new_zoom):
@@ -389,4 +395,3 @@ def output_tile_diff_image(changed_tiles, new_image_location, output_file_name):
 
 if __name__ == '__main__':
     main()
-
