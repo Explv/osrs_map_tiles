@@ -104,6 +104,8 @@ def main():
             changed_tiles = join_tiles_to_new_zoom(changed_tiles, plane, zoom, zoom - 1)
             LOG.info("Done")
 
+        subprocess.run(['cp', new_image_location, old_image_location], check=True)
+
 
 def download_cache():
     caches = requests.get(CACHES_BASE_URL + "/caches", allow_redirects=True)
