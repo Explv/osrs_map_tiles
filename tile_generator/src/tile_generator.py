@@ -4,9 +4,9 @@ from enum import Enum
 from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
-
+from multiprocessing import Pool
 from PIL import Image, ImageDraw
-from skimage.measure import compare_ssim
+from skimage.metrics import structural_similarity
 import logging
 import numpy as np
 import pyvips
@@ -16,10 +16,13 @@ import subprocess
 from datetime import datetime
 import re
 import zipfile
+import shutil
+
 
 CACHES_BASE_URL = "https://archive.openrs2.org"
 
 LOG = logging.getLogger(__name__)
+LOG.setLevel(logging.INFO)
 
 Image.MAX_IMAGE_PIXELS = 1000000000000000
 
@@ -33,18 +36,16 @@ MAX_Z = 3
 
 REPO_DIR = '/repo' # Name of the directory mounted on the local machine
 OUTPUT_DIR = os.path.join(REPO_DIR, 'output/')
-CACHE_DIR = os.path.join(OUTPUT_DIR, 'cache/')
+ROOT_CACHE_DIR = os.path.join(OUTPUT_DIR, 'cache/')
 DIFF_DIR = os.path.join(OUTPUT_DIR, 'diff/')
-XTEA_FILE = os.path.join(CACHE_DIR, "xteas.json")
 GENERATED_FULL_IMAGES = os.path.join(OUTPUT_DIR, 'generated_images/')
 TILE_DIR = REPO_DIR
 
 image_prefix = "full_image_"
 
-
 logging.basicConfig(
     format='%(asctime)s %(levelname)-4s %(message)s',
-    level=logging.INFO,
+    level=logging.WARNING,
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
@@ -60,56 +61,45 @@ def main():
     os.makedirs(DIFF_DIR, exist_ok=True)
 
     LOG.info("Downloading cache & XTEAs")
-    download_cache()
+    [cache_dir, xtea_file] = download_cache()
 
     LOG.info("Building map base images")
-    build_full_map_images()
+    build_full_map_images(cache_dir, xtea_file)
 
+    LOG.info("Generating tiles")
     for plane in range(MAX_Z + 1):
-        LOG.info(f"Generating plane {plane}")
-        LOG.info("Loading images into memory")
-    
-        old_image_location = os.path.join(REPO_DIR, f"full_image_{plane}.png")
-        new_image_location = os.path.join(GENERATED_FULL_IMAGES, f"img-{plane}.png")
-
-        old_image = pyvips.Image.new_from_file(old_image_location)
-    
-        new_image = pyvips.Image.new_from_file(new_image_location)
-    
-        image_width = new_image.width
-        image_width_tiles = int(image_width / TILE_SIZE_PX)
-    
-        starting_zoom = int(math.sqrt(math.pow(2, math.ceil(math.log(image_width_tiles) / math.log(2)))))
-    
-        LOG.info("Calculating changed tiles")
-        changed_tiles = get_changed_tiles(old_image, new_image, starting_zoom)
-    
-        LOG.info("Storing diff image")
-        output_tile_diff_image(changed_tiles, new_image_location,  str(Path(DIFF_DIR, f"diff_{plane}.png")))
-    
-        LOG.info(f"Found {len(changed_tiles)} changed tiles at zoom level {starting_zoom}")
-    
-        LOG.info(f"Saving changed tiles at zoom level {starting_zoom}")
-        for tile in changed_tiles:
-            save_tile(tile["image"], plane, starting_zoom, tile["x"], tile["y"])
-    
-        next_changed_tiles = changed_tiles
-        for zoom in range(starting_zoom + 1, MAX_ZOOM + 1):
-            LOG.info(f"Splitting changed tiles from zoom level {zoom-1} to zoom level {zoom}")
-            next_changed_tiles = split_tiles_to_new_zoom(next_changed_tiles, plane, zoom)
-            LOG.info("Done")
-    
-        for zoom in reversed(range(MIN_ZOOM + 1, starting_zoom + 1)):
-            LOG.info(f"Joining changed tiles from zoom level {zoom} to zoom level {zoom - 1}")
-            changed_tiles = join_tiles_to_new_zoom(changed_tiles, plane, zoom, zoom - 1)
-            LOG.info("Done")
-
-        subprocess.run(['cp', new_image_location, old_image_location], check=True)
-
+        generate_tiles_for_plane(plane)
+       
 
 def download_cache():
+    latest_cache_version = fetch_latest_osrs_cache_version()
+
+    LOG.info(f"Cache version: {latest_cache_version['links']['base']}")
+    LOG.info(f"Cache upload date: {latest_cache_version['timestamp']}")
+    LOG.info(f"Cache build: {latest_cache_version['build(s)']}")
+    
+    cache_dir = os.path.join(ROOT_CACHE_DIR, latest_cache_version['timestamp'].strftime("%Y-%m-%d_%H_%M_%S") + "/")
+    xtea_file = os.path.join(cache_dir, "xteas.json")
+
+    if os.path.isdir(cache_dir):
+        print(f"Cache directory already exists, skipping download")
+    else:
+        os.makedirs(cache_dir, exist_ok=True)
+        download_xteas(latest_cache_version["links"]["xteas"], xtea_file)
+        download_and_extract_cache(latest_cache_version["links"]["cache"], cache_dir)
+
+    return [cache_dir, xtea_file]
+
+
+def fetch_latest_osrs_cache_version():
+    cache_versions = fetch_osrs_cache_versions()
+    latest_cache_version = max(cache_versions, key=lambda cache_version: cache_version["timestamp"])
+    return latest_cache_version
+    
+
+def fetch_osrs_cache_versions():
     caches = requests.get(CACHES_BASE_URL + "/caches", allow_redirects=True)
-    soup = BeautifulSoup(caches.content)
+    soup = BeautifulSoup(caches.content, features="html.parser")
     cache_table = soup.find('table')
     table_body = cache_table.find('tbody')
     rows = table_body.find_all('tr')
@@ -117,65 +107,91 @@ def download_cache():
     header = cache_table.find("thead")
     header_cols = header.find_all('th')
     header_texts = [ col.text.strip().lower() for col in header_cols ]
-    game_index = header_texts.index("game")
-    timestamp_index = header_texts.index("timestamp")
-    links_index = header_texts.index("links")
 
     oldschool_rows = []
     for row in rows:
         columns = row.find_all('td')
-        if columns[game_index].text.strip().lower() == "oldschool":
-            oldschool_rows.append(row.find_all('td'))
+        mapped_row = {}
 
-    max_old_school_row = None
-    max_old_school_timestamp = None
+        for i in range(len(columns)):
+            column = columns[i]
+            header_text = header_texts[i]
+            mapped_row[header_text] = column
 
-    for row in oldschool_rows:
-        timestamp_str = re.sub(r'\s+', '', row[timestamp_index].text)
-        if timestamp_str:
+        if mapped_row["game"].text.strip().lower() == "oldschool":
+            timestamp_str = re.sub(r'\s+', '', mapped_row["timestamp"].text)
+
+            if not timestamp_str:
+                continue
+
             timestamp = datetime.strptime(timestamp_str,"%Y-%m-%d%H:%M:%S")
-            if max_old_school_timestamp is None or timestamp > max_old_school_timestamp:
-                max_old_school_row = row
-                max_old_school_timestamp = timestamp
+            mapped_row["timestamp"] = timestamp
 
-    links_col = max_old_school_row[links_index]
+            links_col = mapped_row["links"]
 
-    cache_link = links_col.find('a', { 'href': re.compile(r'\/caches\/runescape\/(\d+)\/disk.zip') }).get('href')
-    xtea_link = links_col.find('a', { 'href': re.compile(r'\/caches\/runescape\/(\d+)\/keys.json') }).get('href')
+            cache_link = links_col.find('a', { 'href': re.compile(r'\/caches\/runescape\/(\d+)\/disk.zip') }).get('href')
 
-    os.makedirs(CACHE_DIR, exist_ok=True)
+            if not cache_link:
+                raise ValueError("Failed to extract cache version from HTML")
 
-    xtea_file_json = requests.get(CACHES_BASE_URL + xtea_link, allow_redirects=True).json()
+            cache_idx_num = re.match(r'\/caches\/runescape\/(\d+)\/disk.zip', cache_link).group(1) 
 
-    output = []
+            mapped_row["links"] = {
+                "base": f"{CACHES_BASE_URL}/caches/runescape/{cache_idx_num}",
+                "cache": f"{CACHES_BASE_URL}/caches/runescape/{cache_idx_num}/disk.zip",
+                "xteas": f"{CACHES_BASE_URL}/caches/runescape/{cache_idx_num}/keys.json"
+            }
 
-    for region in xtea_file_json:
-        output.append({
+            if mapped_row["build(s)"]:
+                mapped_row["build(s)"] = [build.replace(" ", "") for build in mapped_row["build(s)"].text.strip().split("\n")]
+
+            oldschool_rows.append(mapped_row)
+
+    return oldschool_rows
+
+
+def download_xteas(xtea_url, output_file):
+    xtea_file_json = requests.get(xtea_url, allow_redirects=True).json()
+
+    runelite_xteas = map_openrs2_xteas_to_runelite_format(xtea_file_json)
+
+    with open(output_file, 'w') as f:
+        json.dump(runelite_xteas, f,  indent=4)
+    
+
+def map_openrs2_xteas_to_runelite_format(xteas): 
+    return [
+        {
             "region": region["mapsquare"],
             "keys": region["key"]
-        })
+        }
+        for region in xteas
+    ]
 
-    with open(XTEA_FILE, 'w') as f:
-        json.dump(output, f,  indent=4)
 
-    cache_zip = os.path.join(CACHE_DIR, "cache.zip")
-    cache_content = requests.get(CACHES_BASE_URL + cache_link, allow_redirects=True).content
+def download_and_extract_cache(cache_zip_url, output_dir):
+    cache_zip = os.path.join(output_dir, "cache.zip")
+    cache_content = requests.get(cache_zip_url, allow_redirects=True).content
 
     with open(cache_zip, 'wb') as f:
         f.write(cache_content)
 
-    with zipfile.ZipFile(cache_zip, "r") as f:
-        f.extractall(OUTPUT_DIR)
+    with zipfile.ZipFile(cache_zip, "r") as zip_file:
+        for name in zip_file.namelist():
+            basename = os.path.basename(name)
+            
+            if not basename:
+                continue
+
+            member = zip_file.open(name)
+            with open(os.path.join(output_dir, basename), 'wb') as outfile:
+                shutil.copyfileobj(member, outfile)
 
     os.remove(cache_zip)
 
 
-def build_full_map_images():
+def build_full_map_images(cache_dir, xtea_file):
     os.chdir('/runelite/cache')
-
-    subprocess.run(['git', 'pull'], check=True)
-
-    subprocess.run(['mvn', '-Dmaven.test.skip', '-DskipTests', 'package'], check=True)
 
     jar_file = glob.glob("target/*jar-with-dependencies.jar")[0]
 
@@ -186,12 +202,56 @@ def build_full_map_images():
             '-cp', 
             jar_file,
             'net.runelite.cache.MapImageDumper', 
-            '--cachedir', CACHE_DIR, 
-            '--xteapath', XTEA_FILE, 
+            '--cachedir', cache_dir, 
+            '--xteapath', xtea_file, 
             '--outputdir', GENERATED_FULL_IMAGES
         ], 
         check=True
     )
+
+
+def generate_tiles_for_plane(plane):
+    log_prefix = f"[Plane: {plane}]:"
+
+    LOG.info(f"{log_prefix} Generating plane {plane}")
+    LOG.info(f"{log_prefix} Loading images into memory")
+
+    old_image_location = os.path.join(REPO_DIR, f"full_image_{plane}.png")
+    new_image_location = os.path.join(GENERATED_FULL_IMAGES, f"img-{plane}.png")
+
+    old_image = pyvips.Image.new_from_file(old_image_location)
+
+    new_image = pyvips.Image.new_from_file(new_image_location)
+
+    image_width = new_image.width
+    image_width_tiles = int(image_width / TILE_SIZE_PX)
+
+    starting_zoom = int(math.sqrt(math.pow(2, math.ceil(math.log(image_width_tiles) / math.log(2)))))
+
+    LOG.info(f"{log_prefix} Calculating changed tiles")
+    changed_tiles = get_changed_tiles(old_image, new_image, starting_zoom)
+
+    LOG.info(f"{log_prefix} Storing diff image")
+    output_tile_diff_image(changed_tiles, new_image_location,  str(Path(DIFF_DIR, f"diff_{plane}.png")))
+
+    LOG.info(f"{log_prefix} Found {len(changed_tiles)} changed tiles at zoom level {starting_zoom}")
+
+    LOG.info(f"{log_prefix} Saving changed tiles at zoom level {starting_zoom}")
+    for tile in changed_tiles:
+        save_tile(tile["image"], plane, starting_zoom, tile["x"], tile["y"])
+
+    next_changed_tiles = changed_tiles
+    for zoom in range(starting_zoom + 1, MAX_ZOOM + 1):
+        LOG.info(f"{log_prefix} Splitting changed tiles from zoom level {zoom-1} to zoom level {zoom}")
+        next_changed_tiles = split_tiles_to_new_zoom(next_changed_tiles, plane, zoom)
+        LOG.info(f"{log_prefix} Done")
+
+    for zoom in reversed(range(MIN_ZOOM + 1, starting_zoom + 1)):
+        LOG.info(f"{log_prefix} Joining changed tiles from zoom level {zoom} to zoom level {zoom - 1}")
+        changed_tiles = join_tiles_to_new_zoom(changed_tiles, plane, zoom, zoom - 1)
+        LOG.info(f"{log_prefix} Done")
+
+    subprocess.run(['cp', new_image_location, old_image_location], check=True)
 
 
 def get_changed_tiles(old_image, new_image, zoom):
@@ -217,7 +277,7 @@ def get_changed_tiles(old_image, new_image, zoom):
                                       dtype=np.uint8,
                                       shape=[new_image_tile.height, new_image_tile.width, new_image_tile.bands])
 
-            ssim = compare_ssim(old_image_np, new_image_np, multichannel=True)
+            ssim = structural_similarity(old_image_np, new_image_np, multichannel=True)
 
             has_changed = ssim < 0.999
 
@@ -383,7 +443,6 @@ def load_tile(plane, zoom, x, y):
 
 
 def output_tile_diff_image(changed_tiles, new_image_location, output_file_name):
-
     diff_img = im = Image.open(new_image_location)
 
     draw = ImageDraw.Draw(im)
