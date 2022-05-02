@@ -29,13 +29,6 @@ RUN conda install -c conda-forge maven
 # Clone runelite repo
 RUN git clone https://github.com/runelite/runelite.git /runelite
 
-# Override runelite files
-ADD runelite-overrides /runelite-overrides
-RUN cp /runelite-overrides/BigBufferedImage.java /runelite/cache/src/main/java/net/runelite/cache/util/BigBufferedImage.java
-RUN cp /runelite-overrides/MapImageDumper.java /runelite/cache/src/main/java/net/runelite/cache/MapImageDumper.java
-RUN cp /runelite-overrides/RegionLoader.java /runelite/cache/src/main/java/net/runelite/cache/region/RegionLoader.java
-RUN cp /runelite-overrides/pom.xml /runelite/cache/pom.xml
-
 # Add required files
 ADD src src
 

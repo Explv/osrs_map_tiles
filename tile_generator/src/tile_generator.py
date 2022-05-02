@@ -186,9 +186,9 @@ def build_full_map_images():
             '-cp', 
             jar_file,
             'net.runelite.cache.MapImageDumper', 
-            CACHE_DIR, 
-            XTEA_FILE, 
-            GENERATED_FULL_IMAGES
+            '--cachedir', CACHE_DIR, 
+            '--xteapath', XTEA_FILE, 
+            '--outputdir', GENERATED_FULL_IMAGES
         ], 
         check=True
     )
