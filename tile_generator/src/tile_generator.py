@@ -1,23 +1,23 @@
-import math
-import os
-from enum import Enum
-from pathlib import Path
-import requests
-from bs4 import BeautifulSoup
-from multiprocessing import Pool
-from PIL import Image, ImageDraw
-from skimage.metrics import structural_similarity
-import logging
-import numpy as np
-import pyvips
 import glob
 import json
-import subprocess
-from datetime import datetime
+import logging
+import math
+import os
 import re
-import zipfile
 import shutil
+import subprocess
+import zipfile
+from datetime import datetime
+from enum import Enum
+from multiprocessing import Pool
+from pathlib import Path
 
+import numpy as np
+import pyvips
+import requests
+from bs4 import BeautifulSoup
+from PIL import Image, ImageDraw
+from skimage.metrics import structural_similarity
 
 CACHES_BASE_URL = "https://archive.openrs2.org"
 
