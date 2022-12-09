@@ -28,6 +28,8 @@ RUN conda install -c conda-forge maven
 
 # Clone runelite repo
 RUN git clone https://github.com/runelite/runelite.git /runelite
+# Install runelite
+RUN mvn -f /runelite/pom.xml install -DskipTests
 
 # Add required files
 ADD src src
