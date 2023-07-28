@@ -255,31 +255,47 @@ def generate_tiles_for_plane(plane):
 
 
 def get_changed_tiles(old_image, new_image, zoom):
-    # We assume here that both images are the same size.
-    img_width_px = new_image.width
-    img_height_px = new_image.height
+    old_img_width_px = old_image.width
+    old_image_height_px = old_image.height
+
+    max_old_image_tile_x = old_img_width_px - TILE_SIZE_PX
+    max_old_image_tile_y = old_image_height_px - TILE_SIZE_PX
+
+    new_img_width_px = new_image.width
+    new_img_height_px = new_image.height
+
+    if old_img_width_px != new_img_width_px or old_img_height_px != new_img_height_px:
+        print("WARNING: Image sizes are different!")
 
     changed_tiles = []
 
-    for tile_x in range(0, img_width_px, TILE_SIZE_PX):
-        for tile_y in range(0, img_height_px, TILE_SIZE_PX):
-            old_image_tile = old_image.crop(tile_x, tile_y, TILE_SIZE_PX, TILE_SIZE_PX)
-            new_image_tile = new_image.crop(tile_x, tile_y, TILE_SIZE_PX, TILE_SIZE_PX)
+    # Loop over all tiles in the new image
+    for tile_x in range(0, new_img_width_px, TILE_SIZE_PX):
+        for tile_y in range(0, new_img_height_px, TILE_SIZE_PX):
+            has_changed = False
 
-            old_image_buff = old_image_tile.write_to_memory()
-            new_image_buff = new_image_tile.write_to_memory()
+            # If the new image is bigger than the old image, any tiles that exceed the old size
+            # are considered changed tiles
+            if tile_x > max_old_image_tile_x or tile_y > max_old_image_tile_y:
+                has_changed = True
+            else:
+                old_image_tile = old_image.crop(tile_x, tile_y, TILE_SIZE_PX, TILE_SIZE_PX)
+                new_image_tile = new_image.crop(tile_x, tile_y, TILE_SIZE_PX, TILE_SIZE_PX)
 
-            old_image_np = np.ndarray(buffer=old_image_buff,
-                                      dtype=np.uint8,
-                                      shape=[old_image_tile.height, old_image_tile.width, old_image_tile.bands])
+                old_image_buff = old_image_tile.write_to_memory()
+                new_image_buff = new_image_tile.write_to_memory()
 
-            new_image_np = np.ndarray(buffer=new_image_buff,
-                                      dtype=np.uint8,
-                                      shape=[new_image_tile.height, new_image_tile.width, new_image_tile.bands])
+                old_image_np = np.ndarray(buffer=old_image_buff,
+                                        dtype=np.uint8,
+                                        shape=[old_image_tile.height, old_image_tile.width, old_image_tile.bands])
 
-            ssim = structural_similarity(old_image_np, new_image_np, multichannel=True)
+                new_image_np = np.ndarray(buffer=new_image_buff,
+                                        dtype=np.uint8,
+                                        shape=[new_image_tile.height, new_image_tile.width, new_image_tile.bands])
 
-            has_changed = ssim < 0.999
+                ssim = structural_similarity(old_image_np, new_image_np, multichannel=True)
+
+                has_changed = ssim < 0.999
 
             if has_changed:
                 x = int(tile_x / TILE_SIZE_PX)
