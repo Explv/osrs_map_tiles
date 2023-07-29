@@ -1,3 +1,7 @@
+"""
+Tile generator for creating tile sets for OSRS maps to be used with map viewers such as leaflet.
+"""
+
 import glob
 import json
 import logging
@@ -12,6 +16,9 @@ from enum import Enum
 from multiprocessing import Pool
 from pathlib import Path
 
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed, thread
+import concurrent.futures
 import numpy as np
 import pyvips
 import requests
@@ -35,10 +42,8 @@ MIN_Z = 0
 MAX_Z = 3
 
 REPO_DIR = '/repo' # Name of the directory mounted on the local machine
-OUTPUT_DIR = os.path.join(REPO_DIR, 'output/')
-ROOT_CACHE_DIR = os.path.join(OUTPUT_DIR, 'cache/')
-DIFF_DIR = os.path.join(OUTPUT_DIR, 'diff/')
-GENERATED_FULL_IMAGES = os.path.join(OUTPUT_DIR, 'generated_images/')
+ROOT_CACHE_DIR = os.path.join(REPO_DIR, 'cache/')
+GENERATED_FULL_IMAGES = os.path.join(REPO_DIR, 'generated_images/')
 TILE_DIR = REPO_DIR
 
 image_prefix = "full_image_"
@@ -49,6 +54,10 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+DEFAULT_TILE_IMAGE = (
+    pyvips.Image.black(TILE_SIZE_PX, TILE_SIZE_PX, bands=4)
+    .draw_rect([0, 0, 0, 0], 0, 0, TILE_SIZE_PX, TILE_SIZE_PX, fill=True)
+)
 
 class Side(Enum):
     TOP_LEFT = 1
@@ -58,10 +67,8 @@ class Side(Enum):
 
 
 def main():
-    os.makedirs(DIFF_DIR, exist_ok=True)
-
     LOG.info("Downloading cache & XTEAs")
-    [cache_dir, xtea_file] = download_cache()
+    [cache_dir, xtea_file] = download_cache_with_xteas()
 
     LOG.info("Building map base images")
     build_full_map_images(cache_dir, xtea_file)
@@ -69,9 +76,23 @@ def main():
     LOG.info("Generating tiles")
     for plane in range(MAX_Z + 1):
         generate_tiles_for_plane(plane)
+
+    for plane in range(MIN_Z, MAX_Z + 1):
+        previous_map_image_name = os.path.join(GENERATED_FULL_IMAGES, f"previous-map-image-{plane}.png")
+        current_map_image_name = os.path.join(GENERATED_FULL_IMAGES, f"current-map-image-{plane}.png")
+        generated_file_name = os.path.join(GENERATED_FULL_IMAGES, f"img-{plane}.png")
+
+        os.replace(current_map_image_name, previous_map_image_name)
+        os.replace(generated_file_name, current_map_image_name)
+        os.remove(generated_file_name)
        
 
-def download_cache():
+def download_cache_with_xteas():
+    """
+        Downloads latest cache and XTEAs from specified URL.
+        These are both hard requirements for generating the full OSRS map image with Runelite
+    """
+
     latest_cache_version = fetch_latest_osrs_cache_version()
 
     LOG.info(f"Cache version: {latest_cache_version['links']['base']}")
@@ -92,12 +113,19 @@ def download_cache():
 
 
 def fetch_latest_osrs_cache_version():
+    """
+        Returns the latest OSRS cache version based on upload timestamp
+    """
     cache_versions = fetch_osrs_cache_versions()
     latest_cache_version = max(cache_versions, key=lambda cache_version: cache_version["timestamp"])
     return latest_cache_version
     
 
 def fetch_osrs_cache_versions():
+    """
+        Returns a list of OSRS cache version with upload timestamp
+        by scaping https://archive.openrs2.org
+    """
     caches = requests.get(CACHES_BASE_URL + "/caches", allow_redirects=True)
     soup = BeautifulSoup(caches.content, features="html.parser")
     cache_table = soup.find('table')
@@ -151,6 +179,9 @@ def fetch_osrs_cache_versions():
 
 
 def download_xteas(xtea_url, output_file):
+    """
+        Downloads XTEAs in the format required by Runelite
+    """
     xtea_file_json = requests.get(xtea_url, allow_redirects=True).json()
 
     runelite_xteas = map_openrs2_xteas_to_runelite_format(xtea_file_json)
@@ -191,6 +222,9 @@ def download_and_extract_cache(cache_zip_url, output_dir):
 
 
 def build_full_map_images(cache_dir, xtea_file):
+    """
+        Runs Runelite's MapImageDumper Java program to generate full OSRS map images
+    """
     os.chdir('/runelite/cache')
 
     jar_file = glob.glob("target/*jar-with-dependencies.jar")[0]
@@ -209,18 +243,39 @@ def build_full_map_images(cache_dir, xtea_file):
         check=True
     )
 
+    for plane in range(MIN_Z, MAX_Z + 1):
+        new_map_image_path = os.path.join(GENERATED_FULL_IMAGES, f"img-{plane}.png")
+        renamed_new_map_image_path = os.path.join(GENERATED_FULL_IMAGES, f"new-map-image-{plane}.png")
+        os.replace(new_map_image_path, renamed_new_map_image_path)
+
 
 def generate_tiles_for_plane(plane):
+    """
+        Generates OSRS map tiles for a given Z plane.
+        
+        The tiles are generated from the full OSRS map image by:
+            1. Finding which "zoom" level the full image is in
+            2. Splitting the full image into tiles at each higher zoom level from the original (e.g. 8 -> 9 -> 10 -> 11)
+            3. Joining split tiles in the original zoom level to lower zoom levels (e.g. 8 -> 7 -> 6)
+
+        This process is optimised by first diffing the new full OSRS map image with the previously generated OSRS Map image for the previous cache version.
+        We use pyvips to compare each tile at the original zoom level (e.g. 8) with the tile at the same coordinates at the same zoom level in the old image.
+        We then only split & join tiles which have changed, to higher or lower zoom levels. This massively reduces the output size & run time of the program.
+
+        In an ideal world we would load the new cache & old cache (with XTEAs) and compare the underlying data for a given region to see if tiles have changed.
+        However I'm too lazy to implement that right now, so instead we're just comparing images.
+
+        Where possible we also utilise threadpools to speed up the process.
+    """
     log_prefix = f"[Plane: {plane}]:"
 
     LOG.info(f"{log_prefix} Generating plane {plane}")
     LOG.info(f"{log_prefix} Loading images into memory")
 
-    old_image_location = os.path.join(REPO_DIR, f"full_image_{plane}.png")
-    new_image_location = os.path.join(GENERATED_FULL_IMAGES, f"img-{plane}.png")
+    old_image_location = os.path.join(GENERATED_FULL_IMAGES, f"current-map-image-{plane}.png")
+    new_image_location = os.path.join(GENERATED_FULL_IMAGES, f"new-map-image-{plane}.png")
 
     old_image = pyvips.Image.new_from_file(old_image_location)
-
     new_image = pyvips.Image.new_from_file(new_image_location)
 
     image_width = new_image.width
@@ -229,10 +284,10 @@ def generate_tiles_for_plane(plane):
     starting_zoom = int(math.sqrt(math.pow(2, math.ceil(math.log(image_width_tiles) / math.log(2)))))
 
     LOG.info(f"{log_prefix} Calculating changed tiles")
-    changed_tiles = get_changed_tiles(old_image, new_image, starting_zoom)
+    changed_tiles = get_changed_tiles(old_image, new_image, plane, starting_zoom)
 
     LOG.info(f"{log_prefix} Storing diff image")
-    output_tile_diff_image(changed_tiles, new_image_location,  str(Path(DIFF_DIR, f"diff_{plane}.png")))
+    output_tile_diff_image(changed_tiles, new_image_location,  str(Path(GENERATED_FULL_IMAGES, f"diff-map-image-{plane}.png")))
 
     LOG.info(f"{log_prefix} Found {len(changed_tiles)} changed tiles at zoom level {starting_zoom}")
 
@@ -251,51 +306,33 @@ def generate_tiles_for_plane(plane):
         changed_tiles = join_tiles_to_new_zoom(changed_tiles, plane, zoom, zoom - 1)
         LOG.info(f"{log_prefix} Done")
 
-    subprocess.run(['cp', new_image_location, old_image_location], check=True)
 
-
-def get_changed_tiles(old_image, new_image, zoom):
-    old_img_width_px = old_image.width
-    old_image_height_px = old_image.height
-
-    max_old_image_tile_x = old_img_width_px - TILE_SIZE_PX
-    max_old_image_tile_y = old_image_height_px - TILE_SIZE_PX
-
-    new_img_width_px = new_image.width
-    new_img_height_px = new_image.height
-
-    if old_img_width_px != new_img_width_px or old_img_height_px != new_img_height_px:
-        print("WARNING: Image sizes are different!")
+def get_changed_tiles(old_image, new_image, plane, zoom):
+    new_image_width_px = new_image.width
+    new_image_height_px = new_image.height
 
     changed_tiles = []
 
-    # Loop over all tiles in the new image
-    for tile_x in range(0, new_img_width_px, TILE_SIZE_PX):
-        for tile_y in range(0, new_img_height_px, TILE_SIZE_PX):
-            has_changed = False
+    with thread_pool_executor() as executor:
+        futures = []
 
-            # If the new image is bigger than the old image, any tiles that exceed the old size
-            # are considered changed tiles
-            if tile_x > max_old_image_tile_x or tile_y > max_old_image_tile_y:
-                has_changed = True
-            else:
-                old_image_tile = old_image.crop(tile_x, tile_y, TILE_SIZE_PX, TILE_SIZE_PX)
-                new_image_tile = new_image.crop(tile_x, tile_y, TILE_SIZE_PX, TILE_SIZE_PX)
+        # Loop over all tiles in the new image
+        for tile_x in range(0, new_image_width_px, TILE_SIZE_PX):
+            for tile_y in range(0, new_image_height_px, TILE_SIZE_PX):
+                futures.append(
+                    executor.submit(
+                        has_tile_changed,
+                        plane=plane,
+                        zoom=zoom,
+                        tile_x=tile_x,
+                        tile_y=tile_y,
+                        old_image=old_image,
+                        new_image=new_image
+                    )
+                )
 
-                old_image_buff = old_image_tile.write_to_memory()
-                new_image_buff = new_image_tile.write_to_memory()
-
-                old_image_np = np.ndarray(buffer=old_image_buff,
-                                        dtype=np.uint8,
-                                        shape=[old_image_tile.height, old_image_tile.width, old_image_tile.bands])
-
-                new_image_np = np.ndarray(buffer=new_image_buff,
-                                        dtype=np.uint8,
-                                        shape=[new_image_tile.height, new_image_tile.width, new_image_tile.bands])
-
-                ssim = structural_similarity(old_image_np, new_image_np, multichannel=True)
-
-                has_changed = ssim < 0.999
+        for future in concurrent.futures.as_completed(futures):
+            ((tile_x, tile_y), new_image_tile, has_changed) = future.result()
 
             if has_changed:
                 x = int(tile_x / TILE_SIZE_PX)
@@ -314,116 +351,181 @@ def get_changed_tiles(old_image, new_image, zoom):
     return changed_tiles
 
 
+def has_tile_changed(plane, zoom, tile_x, tile_y, old_image, new_image):
+    new_image_tile = new_image.crop(tile_x, tile_y, TILE_SIZE_PX, TILE_SIZE_PX)
+
+    # If there is no tile at (tile_x, tile_y) in the old image
+    if tile_x > old_image.width - TILE_SIZE_PX or tile_y > old_image.height - TILE_SIZE_PX:
+        return ((tile_x, tile_y), new_image_tile, True)
+
+    old_image_tile = old_image.crop(tile_x, tile_y, TILE_SIZE_PX, TILE_SIZE_PX)
+
+    old_image_buff = old_image_tile.write_to_memory()
+    new_image_buff = new_image_tile.write_to_memory()
+
+    old_image_np = np.ndarray(buffer=old_image_buff,
+                            dtype=np.uint8,
+                            shape=[old_image_tile.height, old_image_tile.width, old_image_tile.bands])
+
+    new_image_np = np.ndarray(buffer=new_image_buff,
+                            dtype=np.uint8,
+                            shape=[new_image_tile.height, new_image_tile.width, new_image_tile.bands])
+
+    ssim = structural_similarity(old_image_np, new_image_np, multichannel=True)
+
+    has_changed = ssim < 0.999
+
+    return ((tile_x, tile_y), new_image_tile, has_changed)
+
+
 def split_tiles_to_new_zoom(changed_tiles, plane, new_zoom):
     new_changed_tiles = []
 
-    for changed_tile in changed_tiles:
-        original_x = changed_tile["x"]
-        original_y = changed_tile["y"]
+    with thread_pool_executor() as executor:
+        futures = []
 
-        tile_image = changed_tile["image"]
+        for changed_tile in changed_tiles:
+            futures.append(
+                executor.submit(
+                    split_tile_to_new_zoom,
+                    changed_tile=changed_tile,
+                    plane=plane,
+                    new_zoom=new_zoom
+                )
+            )
 
-        tile_image_resized = tile_image.resize(2, kernel='nearest')
+        for future in concurrent.futures.as_completed(futures):
+            new_changed_tiles.extend(future.result())
 
-        new_x = original_x * 2
-        new_y = original_y * 2
+    return new_changed_tiles
 
-        tile_image_0 = tile_image_resized.crop(0, TILE_SIZE_PX, TILE_SIZE_PX, TILE_SIZE_PX)
-        new_changed_tiles.append({
+
+def split_tile_to_new_zoom(changed_tile, plane, new_zoom):
+    original_x = changed_tile["x"]
+    original_y = changed_tile["y"]
+
+    tile_image = changed_tile["image"]
+
+    tile_image_resized = tile_image.resize(2, kernel='nearest')
+
+    new_x = original_x * 2
+    new_y = original_y * 2
+
+    tile_image_0 = tile_image_resized.crop(0, TILE_SIZE_PX, TILE_SIZE_PX, TILE_SIZE_PX)
+    save_tile(tile_image_0, plane, new_zoom, new_x, new_y)
+
+    tile_image_1 = tile_image_resized.crop(TILE_SIZE_PX, TILE_SIZE_PX, TILE_SIZE_PX, TILE_SIZE_PX)
+    save_tile(tile_image_1, plane, new_zoom, new_x + 1, new_y)
+
+    tile_image_2 = tile_image_resized.crop(0, 0, TILE_SIZE_PX, TILE_SIZE_PX)
+    save_tile(tile_image_2, plane, new_zoom, new_x, new_y + 1)
+
+    tile_image_3 = tile_image_resized.crop(TILE_SIZE_PX, 0, TILE_SIZE_PX, TILE_SIZE_PX)
+    save_tile(tile_image_3, plane, new_zoom, new_x + 1, new_y + 1)
+
+    # New tiles at new zoom
+    return [
+        {
             "x": new_x,
             "y": new_y,
             "image": tile_image_0
-        })
-        save_tile(tile_image_0, plane, new_zoom, new_x, new_y)
-
-        tile_image_1 = tile_image_resized.crop(TILE_SIZE_PX, TILE_SIZE_PX, TILE_SIZE_PX, TILE_SIZE_PX)
-        new_changed_tiles.append({
+        },
+        {
             "x": new_x + 1,
             "y": new_y,
             "image": tile_image_1
-        })
-        save_tile(tile_image_1, plane, new_zoom, new_x + 1, new_y)
-
-        tile_image_2 = tile_image_resized.crop(0, 0, TILE_SIZE_PX, TILE_SIZE_PX)
-        new_changed_tiles.append({
+        },
+        {
             "x": new_x,
             "y": new_y + 1,
             "image": tile_image_2
-        })
-        save_tile(tile_image_2, plane, new_zoom, new_x, new_y + 1)
-
-        tile_image_3 = tile_image_resized.crop(TILE_SIZE_PX, 0, TILE_SIZE_PX, TILE_SIZE_PX)
-        new_changed_tiles.append({
+        },
+        {
             "x": new_x + 1,
             "y": new_y + 1,
             "image": tile_image_3
-        })
-        save_tile(tile_image_3, plane, new_zoom, new_x + 1, new_y + 1)
-
-    return new_changed_tiles
+        }
+    ]
 
 
 def join_tiles_to_new_zoom(changed_tiles, plane, current_zoom, new_zoom):
     new_changed_tiles = []
 
-    for changed_tile in changed_tiles:
-        original_x = changed_tile["x"]
-        original_y = changed_tile["y"]
+    with thread_pool_executor() as executor:
+        futures = []
 
-        is_left = original_x % 2 == 0
-        is_bottom = original_y % 2 == 0
+        for changed_tile in changed_tiles:
+            futures.append(
+                executor.submit(
+                    join_changed_tile_to_new_zoom,
+                    changed_tile=changed_tile,
+                    plane=plane,
+                    current_zoom=current_zoom,
+                    new_zoom=new_zoom
+                )
+            )
 
-        if is_left:
-            side = Side.BOTTOM_LEFT if is_bottom else Side.TOP_LEFT
-        else:
-            side = Side.BOTTOM_RIGHT if is_bottom else Side.TOP_RIGHT
-
-        if side == Side.TOP_LEFT:
-            tiles = [
-                load_tile(plane, current_zoom, original_x, original_y),
-                load_tile(plane, current_zoom, original_x + 1, original_y),
-                load_tile(plane, current_zoom, original_x, original_y - 1),
-                load_tile(plane, current_zoom, original_x + 1, original_y - 1)
-            ]
-        elif side == Side.TOP_RIGHT:
-            tiles = [
-                load_tile(plane, current_zoom, original_x - 1, original_y),
-                load_tile(plane, current_zoom, original_x, original_y),
-                load_tile(plane, current_zoom, original_x - 1, original_y - 1),
-                load_tile(plane, current_zoom, original_x, original_y - 1)
-            ]
-        elif side == Side.BOTTOM_LEFT:
-            tiles = [
-                load_tile(plane, current_zoom, original_x, original_y + 1),
-                load_tile(plane, current_zoom, original_x + 1, original_y + 1),
-                load_tile(plane, current_zoom, original_x, original_y),
-                load_tile(plane, current_zoom, original_x + 1, original_y)
-            ]
-        else:
-            tiles = [
-                load_tile(plane, current_zoom, original_x - 1, original_y + 1),
-                load_tile(plane, current_zoom, original_x, original_y + 1),
-                load_tile(plane, current_zoom, original_x - 1, original_y),
-                load_tile(plane, current_zoom, original_x, original_y)
-            ]
-
-        new_tile_image = pyvips.Image.arrayjoin(tiles, across=2)
-
-        new_tile_image_resized = new_tile_image.resize(0.5, kernel='lanczos3')
-
-        new_x = math.floor(original_x / 2)
-        new_y = math.floor(original_y / 2)
-
-        save_tile(new_tile_image_resized, plane, new_zoom, new_x, new_y)
-
-        new_changed_tiles.append({
-            "x": new_x,
-            "y": new_y,
-            "image": new_tile_image_resized
-        })
+        for future in concurrent.futures.as_completed(futures):
+            new_changed_tiles.append(future.result())
 
     return new_changed_tiles
 
+
+def join_changed_tile_to_new_zoom(changed_tile, plane, current_zoom, new_zoom):
+    original_x = changed_tile["x"]
+    original_y = changed_tile["y"]
+
+    is_left = original_x % 2 == 0
+    is_bottom = original_y % 2 == 0
+
+    if is_left:
+        side = Side.BOTTOM_LEFT if is_bottom else Side.TOP_LEFT
+    else:
+        side = Side.BOTTOM_RIGHT if is_bottom else Side.TOP_RIGHT
+
+    if side == Side.TOP_LEFT:
+        tiles = [
+            load_generated_tile(plane, current_zoom, original_x, original_y),
+            load_generated_tile(plane, current_zoom, original_x + 1, original_y),
+            load_generated_tile(plane, current_zoom, original_x, original_y - 1),
+            load_generated_tile(plane, current_zoom, original_x + 1, original_y - 1)
+        ]
+    elif side == Side.TOP_RIGHT:
+        tiles = [
+            load_generated_tile(plane, current_zoom, original_x - 1, original_y),
+            load_generated_tile(plane, current_zoom, original_x, original_y),
+            load_generated_tile(plane, current_zoom, original_x - 1, original_y - 1),
+            load_generated_tile(plane, current_zoom, original_x, original_y - 1)
+        ]
+    elif side == Side.BOTTOM_LEFT:
+        tiles = [
+            load_generated_tile(plane, current_zoom, original_x, original_y + 1),
+            load_generated_tile(plane, current_zoom, original_x + 1, original_y + 1),
+            load_generated_tile(plane, current_zoom, original_x, original_y),
+            load_generated_tile(plane, current_zoom, original_x + 1, original_y)
+        ]
+    else:
+        tiles = [
+            load_generated_tile(plane, current_zoom, original_x - 1, original_y + 1),
+            load_generated_tile(plane, current_zoom, original_x, original_y + 1),
+            load_generated_tile(plane, current_zoom, original_x - 1, original_y),
+            load_generated_tile(plane, current_zoom, original_x, original_y)
+        ]
+
+    new_tile_image = pyvips.Image.arrayjoin(tiles, across=2)
+
+    new_tile_image_resized = new_tile_image.resize(0.5, kernel='lanczos3')
+
+    new_x = math.floor(original_x / 2)
+    new_y = math.floor(original_y / 2)
+
+    save_tile(new_tile_image_resized, plane, new_zoom, new_x, new_y)
+
+    return {
+        "x": new_x,
+        "y": new_y,
+        "image": new_tile_image_resized
+    }
 
 def save_tile(tile_image, plane, zoom, x, y):
     file_dir = Path(TILE_DIR, str(plane), str(zoom), str(x))
@@ -435,22 +537,16 @@ def save_tile(tile_image, plane, zoom, x, y):
     tile_image.pngsave(str(file_path), compression=9)
 
 
-def load_tile(plane, zoom, x, y):
-    file_path = Path(TILE_DIR, str(plane), str(zoom), str(x), str(y) + ".png")
+def load_generated_tile(plane, zoom, x, y):
+    """
+        Loads a tile image from the tile set stored in the repo
+    """
+    if not generated_tile_exists(plane, zoom, x, y):
+        return DEFAULT_TILE_IMAGE
 
-    if not os.path.isfile(file_path):
-        existing_tile_path = Path(REPO_DIR, str(plane), str(zoom), str(x), str(y) + ".png")
+    file_path = generated_tile_path(plane, zoom, x, y)
 
-        if not os.path.isfile(existing_tile_path):
-            image = pyvips.Image.black(TILE_SIZE_PX, TILE_SIZE_PX, bands=4)
-            image = image.draw_rect([0, 0, 0, 0], 0, 0, TILE_SIZE_PX, TILE_SIZE_PX, fill=True)
-            return image
-        else:
-            path = existing_tile_path
-    else:
-        path = file_path
-
-    image = pyvips.Image.new_from_file(str(path), access="sequential")
+    image = pyvips.Image.new_from_file(str(file_path), access="sequential")
 
     if not image.hasalpha():
         image = image.addalpha()
@@ -458,8 +554,16 @@ def load_tile(plane, zoom, x, y):
     return image
 
 
+def generated_tile_exists(plane, zoom, x, y):
+    return os.path.isfile(generated_tile_path(plane, zoom, x, y))
+
+
+def generated_tile_path(plane, zoom, x, y):
+    return Path(TILE_DIR, str(plane), str(zoom), str(x), str(y) + ".png")
+
+
 def output_tile_diff_image(changed_tiles, new_image_location, output_file_name):
-    diff_img = im = Image.open(new_image_location)
+    diff_image = im = Image.open(new_image_location)
 
     draw = ImageDraw.Draw(im)
 
@@ -467,7 +571,18 @@ def output_tile_diff_image(changed_tiles, new_image_location, output_file_name):
         shape = [(tile["pixel_x"], tile["pixel_y"]), (tile["pixel_x"] + TILE_SIZE_PX, tile["pixel_y"] + TILE_SIZE_PX)]
         draw.rectangle(shape, fill=None, outline="red", width=3)
 
-    diff_img.save(output_file_name)
+    diff_image.save(output_file_name)
+
+
+@contextmanager
+def thread_pool_executor():
+    with ThreadPoolExecutor() as executor:
+        try:
+            yield executor
+        except KeyboardInterrupt:
+            LOG.warning("Performing non-graceful shutdown of threads")
+            executor._threads.clear()
+            concurrent.futures.thread._threads_queues.clear()
 
 
 if __name__ == '__main__':

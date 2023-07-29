@@ -1,2 +1,4 @@
 output
+cache
 .idea/
+**/.DS_Store
