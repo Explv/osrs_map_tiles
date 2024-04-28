@@ -2,3 +2,5 @@ output
 cache
 .idea/
 **/.DS_Store
+generated_images/diff-map*.png
+generated_images/previous-map*.png

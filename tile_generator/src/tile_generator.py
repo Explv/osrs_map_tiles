@@ -80,11 +80,10 @@ def main():
     for plane in range(MIN_Z, MAX_Z + 1):
         previous_map_image_name = os.path.join(GENERATED_FULL_IMAGES, f"previous-map-image-{plane}.png")
         current_map_image_name = os.path.join(GENERATED_FULL_IMAGES, f"current-map-image-{plane}.png")
-        generated_file_name = os.path.join(GENERATED_FULL_IMAGES, f"img-{plane}.png")
+        generated_file_name = os.path.join(GENERATED_FULL_IMAGES, f"new-map-image-{plane}.png")
 
         os.replace(current_map_image_name, previous_map_image_name)
         os.replace(generated_file_name, current_map_image_name)
-        os.remove(generated_file_name)
        
 
 def download_cache_with_xteas():
