@@ -19,6 +19,7 @@ RUN conda install --channel conda-forge pyvips
 # Install python dependencies
 COPY requirements.txt requirements.txt
 RUN pip install -r requirements.txt
+RUN pip3 install pyvips
 
 # Install Java 11
 RUN conda install -c conda-forge openjdk=11
