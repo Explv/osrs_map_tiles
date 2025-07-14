@@ -224,9 +224,9 @@ def build_full_map_images(cache_dir, xtea_file):
     """
         Runs Runelite's MapImageDumper Java program to generate full OSRS map images
     """
-    os.chdir('/runelite/cache')
+    os.chdir('/java/build/libs')
 
-    jar_file = glob.glob("target/*jar-with-dependencies.jar")[0]
+    jar_file = glob.glob("mapimage-wrapper-*-all.jar")[0]
 
     subprocess.run(
         [
@@ -234,10 +234,11 @@ def build_full_map_images(cache_dir, xtea_file):
             '-Xmx8g', 
             '-cp', 
             jar_file,
-            'net.runelite.cache.MapImageDumper', 
+            'org.explv.mapimage.Main', 
             '--cachedir', cache_dir, 
             '--xteapath', xtea_file, 
-            '--outputdir', GENERATED_FULL_IMAGES
+            '--outputdir', GENERATED_FULL_IMAGES,
+            '--renderLabels', 'false'
         ], 
         check=True
     )

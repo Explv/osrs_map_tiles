@@ -28,11 +28,15 @@ RUN conda install -c conda-forge openjdk=11
 RUN conda install -c conda-forge maven
 
 # Clone runelite repo
-RUN git clone https://github.com/runelite/runelite.git /runelite
+# RUN git clone https://github.com/runelite/runelite.git /runelite
 # Install runelite
-RUN mvn -f /runelite/pom.xml install -DskipTests
+# RUN mvn -f /runelite/pom.xml install -pl cache -am -DskipTests
 
 # Add required files
 ADD src src
+ADD java /java
+
+RUN chmod +x /java/gradlew
+RUN /java/gradlew -p /java build
 
 CMD [ "conda", "run", "--no-capture-output", "-n", "vips", "python", "./src/tile_generator.py" ]
