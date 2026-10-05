@@ -35,6 +35,10 @@ fun getLatestRunelite(): String {
 
 dependencies {
     implementation("net.runelite:cache:${getLatestRunelite()}")
+
+    implementation("org.antlr:antlr4-runtime:4.13.2")
+    implementation("commons-cli:commons-cli:1.10.0")
+    implementation("org.slf4j:slf4j-api:2.0.17")
 }
 
 tasks.shadowJar {
